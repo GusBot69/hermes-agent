@@ -411,6 +411,43 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     targetScrollTop: resolveThreadScrollTarget
   })
 
+  // Live mirrors for listeners that must not re-subscribe on every flip.
+  // isAtBottomRef tracks the hook's exposed value ("at bottom OR within the
+  // 70px near-bottom dead zone"), so consumers keep today's dead-zone behavior
+  // while the ref lets them read the LATEST value at event time.
+  const isAtBottomRef = useRef(isAtBottom)
+  isAtBottomRef.current = isAtBottom
+
+  // Wheel-up escape with no blind spot. The library's own wheel handler only
+  // escapes the stick-to-bottom lock when its scrollable-ancestor walk-up
+  // lands exactly on the viewport; a wheel over a NESTED scroller (code block,
+  // table, tool output — anything with overflow-x:auto computes to 'auto' and
+  // stops the walk) is not attributed to the thread, so the lock stays armed
+  // and the next streamed token's resize handler yanks the view back to the
+  // bottom mid-read. Escaping synchronously on ANY wheel-up inside the thread
+  // closes that race. `userEscapedRef` is the same signal for the settle loop,
+  // which must not keep pinning to the bottom against an interrupt.
+  const userEscapedRef = useRef(false)
+
+  useEffect(() => {
+    const el = scrollRef.current
+
+    if (!el) {
+      return
+    }
+
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) {
+        userEscapedRef.current = true
+        stopScroll()
+      }
+    }
+
+    el.addEventListener('wheel', onWheel, { capture: true, passive: true })
+
+    return () => el.removeEventListener('wheel', onWheel, { capture: true })
+  }, [scrollRef, stopScroll])
+
   const { olderAvailable, expandWindow } = useTranscriptWindow()
 
   useEffect(() => {
@@ -593,10 +630,15 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(
     () =>
       subscribeToThreadForeground(
-        () => isAtBottom,
+        // Gate on the LIVE mirror, not the captured value: the hook's exposed
+        // isAtBottom includes the 70px near-bottom dead zone, so a reader who
+        // scrolled up only a little would otherwise be re-anchored to the
+        // bottom on every alt-tab / focus return. The ref is current at event
+        // time and keeps the effect subscribed once.
+        () => isAtBottomRef.current,
         () => void scrollToBottom()
       ),
-    [isAtBottom, scrollToBottom]
+    [scrollToBottom]
   )
 
   const endEditHold = useCallback(() => {
@@ -620,8 +662,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
-  // New run → snap to the latest turn.
-  useAuiEvent('thread.runStart', () => void scrollToBottom())
+  // New run → snap to the latest turn, but never yank a reader out of history.
+  // A remote run (Telegram-side message, cron deliverable, subagent result
+  // re-entering the session) fires runStart while the user may be scrolled up;
+  // only snap when the view is already at (or within the near-bottom dead
+  // zone of) the bottom.
+  useAuiEvent('thread.runStart', () => {
+    if (isAtBottomRef.current) {
+      void scrollToBottom()
+    }
+  })
 
   // Reset the cap and pin to bottom on mount + every session switch (messages
   // swap in place on a long-lived runtime, so sessionKey is the only signal).
@@ -649,6 +699,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     stopScroll()
     el.scrollTop = el.scrollHeight
     loadSettledRef.current = false
+    // A fresh load owns the position; a wheel-up during it is a reader taking
+    // over, so clear the interrupt flag before the settle loop starts.
+    userEscapedRef.current = false
 
     // An anchor captured for the OUTGOING transcript must not be applied to
     // this one — a switch owns the position outright. The empty→non-empty
@@ -666,6 +719,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       const node = scrollRef.current
 
       if (!node) {
+        return
+      }
+
+      // Wheel-up during the settle window = the user is reading, not waiting
+      // for the load to park them. Stop pinning to the bottom immediately and
+      // hand the viewport back. Marking settled makes the backfill anchor
+      // capture their real distance-from-bottom instead of 0 (the bottom).
+      if (userEscapedRef.current) {
+        loadSettledRef.current = true
+
         return
       }
 
